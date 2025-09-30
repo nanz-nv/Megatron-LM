@@ -448,8 +448,15 @@ class _CudagraphReplayNode(torch.autograd.Function):
             if is_first_fp8_module:
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(not is_first_microbatch)
             ctx.is_first_fp8_module = is_first_fp8_module
-
         runner.fwd_graph.replay()
+        eager_mode_fallback = runner.base_module.require_eager_mode_fallback()
+
+        if eager_mode_fallback:
+            ctx.eager_mode_fallback = True
+            return False
+        else:
+            ctx.eager_mode_fallback = False
+
 
         # if last transformer layer, return a clone of the cudagraph output buffer, as releasing
         # the cudagraph output buffer into the rest of the system may allow it to be corrupted
@@ -462,7 +469,6 @@ class _CudagraphReplayNode(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grads):
         """Replay the backward graph of the passed runner."""
-
         runner = ctx.runner
         assert (
             runner.bwd_graph is not None
@@ -583,6 +589,8 @@ class _CudaGraphRunner(torch.nn.Module):
             )
         else:
             self.is_first_layer, self.is_last_layer = True, True
+
+        self.eager_mode_fallback = False
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -880,6 +888,10 @@ class _CudaGraphRunner(torch.nn.Module):
         inp_tensors = self.get_tensors(args, kwargs)
         func_args = inp_tensors + tuple(self.parameters())
         out = _CudagraphReplayNode.apply(self, is_first_microbatch, *func_args)
+        if out is False:
+            self.eager_mode_fallback = True
+            return super(MegatronModule, self.base_module).__call__(*args, **kwargs)
+        self.eager_mode_fallback = False
         out = list(out)
 
         if torch.is_tensor(self.fwd_graph_outputs):
@@ -1279,7 +1291,7 @@ class CudaGraphManager(torch.nn.Module):
                 return super(MegatronModule, megatron_module).__call__(*args, **kwargs)
 
         # If forward only, next replay should be a forward pass as well
-        if self.training and torch.is_grad_enabled():
+        if self.training and torch.is_grad_enabled() and not runner.eager_mode_fallback:
             runner.status = _GraphStatus.BWD_READY
         else:
             runner.status = _GraphStatus.FWD_READY

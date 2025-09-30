@@ -915,3 +915,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 cuda_graph_func = self._cuda_graph_replay
             return cuda_graph_func(*args, **kwargs)
         return super(MegatronModule, self).__call__(*args, **kwargs)
+
+    def setup_knobs_for_eager_mode_fallback(self):
+        self.mlp.token_dispatcher.drop_and_pad = False
+        self.mlp.token_dispatcher.moe_expert_capacity_factor = None
+
+    def require_eager_mode_fallback(self):
+        self.mlp.router.d2h_event.synchronize()
+        num_global_tokens_per_expert = self.mlp.router.num_global_tokens_per_expert_cpu
+        max_ratio = num_global_tokens_per_expert.max() / num_global_tokens_per_expert.float().mean()
+        exceeding_threshold = max_ratio > self.config.moe_expert_capacity_factor
+        return exceeding_threshold
