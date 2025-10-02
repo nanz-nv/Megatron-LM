@@ -402,9 +402,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Token drop and padding.
         # Drop and pad the input to capacity.
         self.drop_and_pad = self.config.moe_pad_expert_input_to_capacity
-        if self.drop_and_pad:
-            assert self.config.moe_expert_capacity_factor is not None
-            self.moe_expert_capacity_factor = self.config.moe_expert_capacity_factor
+        # if self.drop_and_pad:
+        #     assert self.config.moe_expert_capacity_factor is not None
+        self.moe_expert_capacity_factor = self.config.moe_expert_capacity_factor
         self.capacity = None
 
         # A cuda stream synchronization is needed in during token permutation in some cases,
@@ -465,6 +465,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 dtype=torch.long,
                 device=self.permute_idx_device,
             )
+            self.input_splits = None
+            self.output_splits = None
+            self.output_splits_tp = None
             return num_tokens_per_local_expert
 
         # [num_experts], number of tokens assigned to each expert from the current rank's input.

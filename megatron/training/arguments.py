@@ -3084,6 +3084,8 @@ def _add_moe_args(parser):
                        help='The policy to drop tokens. Can be either "probs" or "position". If "probs", the tokens with the lowest probabilities will be dropped. If "position", tokens at the end of each batch will be dropped.')
     group.add_argument('--moe-apply-probs-on-input', action='store_true',
                        help='Apply probs before mlp activation for moe routing.')
+    group.add_argument('--moe-expert-capacity-factor-for-speculative-cuda-graph', type=float, default=None,
+                       help='The capacity factor for each expert, None means no token will be dropped.')
     # MoE communication overlap arguments
     group.add_argument('--overlap-moe-expert-parallel-comm', action='store_true',
                        help='Overlap the EP A2A communication by batch-level overlapping in 1f1b stage.')

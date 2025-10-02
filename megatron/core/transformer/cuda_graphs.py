@@ -663,6 +663,10 @@ class _CudaGraphRunner(torch.nn.Module):
         for _, state in get_all_rng_states().items():
             self.fwd_graph.register_generator_state(state)
 
+
+        # Optionally setup knobs for speculative CUDA graph
+        if self.base_module.config.moe_expert_capacity_factor_for_speculative_cuda_graph is not None:
+            stashed_token_drop_knobs = self.base_module.set_knobs_for_spec_cuda_graph()
         # warmup again as case graph capture mode may execute a different codepath
         for _ in range(self.num_warmup_steps):
             with self.get_quantization_context():
@@ -687,6 +691,10 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.fwd_graph, pool=self.fwd_mempool, capture_error_mode="thread_local"
             ):
                 outputs = self.base_module.forward(*args, **kwargs)
+
+        # Optionally restore knobs for speculative CUDA graph
+        if self.base_module.config.moe_expert_capacity_factor_for_speculative_cuda_graph is not None:
+            self.base_module.resotre_knobs_for_spec_cuda_graph(stashed_token_drop_knobs)
 
         # save cudagraph output buffer
         if isinstance(outputs, torch.Tensor):

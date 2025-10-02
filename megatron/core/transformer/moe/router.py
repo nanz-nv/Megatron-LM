@@ -213,6 +213,8 @@ class TopKRouter(Router):
         self.num_global_tokens_per_expert = torch.empty((self.tp_size, self.ep_size, self.num_experts), device="cuda", dtype=torch.long)
         self.num_global_tokens_per_expert_cpu = torch.empty((self.tp_size, self.ep_size, self.num_experts), device="cpu", pin_memory=True, dtype=torch.long)
         self.d2h_event = torch.cuda.Event(external=True)
+        self.capacity_factor = self.config.moe_expert_capacity_factor
+        self.pad_to_capacity = self.config.moe_pad_expert_input_to_capacity
 
     def _maintain_float32_expert_bias(self):
         """
@@ -406,6 +408,7 @@ class TopKRouter(Router):
         num_layers = self.config.num_layers
         if self.config.mtp_num_layers is not None:
             num_layers += self.config.mtp_num_layers
+
         save_to_aux_losses_tracker(
             aux_loss_name,
             aux_loss / aux_loss_coeff,
@@ -413,6 +416,7 @@ class TopKRouter(Router):
             num_layers,
             reduce_group=reduce_group,
         )
+
         if self.calculate_per_token_loss:
             # Scale the aux_loss by the number of tokens.
             # The expected final scaling for aux_loss gradients is 1/(num_micro_batches * dp_size).
@@ -529,14 +533,14 @@ class TopKRouter(Router):
             )
         self.get_non_token_drop_stats(routing_map)
         # Apply token dropping to probs and routing_map.
-        if self.config.moe_expert_capacity_factor is not None:
+        if self.capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
                 probs,
                 routing_map,
                 router_topk=self.topk,
-                capacity_factor=self.config.moe_expert_capacity_factor,
+                capacity_factor=self.capacity_factor,
                 drop_policy=self.config.moe_token_drop_policy,
-                pad_to_capacity=self.config.moe_pad_expert_input_to_capacity,
+                pad_to_capacity=self.pad_to_capacity,
             )
 
         # Apply each aux loss type and attach aux loss autograd function to probs

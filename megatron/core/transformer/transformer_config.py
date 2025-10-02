@@ -567,6 +567,10 @@ class TransformerConfig(ModelParallelConfig):
     be dropped.
     """
 
+    moe_expert_capacity_factor_for_speculative_cuda_graph: Optional[float] = None
+    """moe_expert_capacity_factor (float): The capacity factor for each expert, None means no token
+    will be dropped. The default is None."""
+
     moe_layer_recompute: bool = False
     """Memory optimization: checkpointing moe_layer to save actiavtion memory."""
 
