@@ -506,6 +506,21 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     routing_map = routing_map.transpose(0, 1)
     return routing_map
 
+def pad_and_drop_routing_map(routing_map: torch.Tensor, budget: torch.Tensor) -> torch.Tensor:
+    num_tokens, num_experts = routing_map.shape
+    
+    # Step 1: Get sort indices (1s first, then 0s for each expert)
+    sort_indices = torch.argsort(routing_map, dim=0, descending=True)
+    
+    # Step 2: Apply budget constraints in sorted order
+    token_positions = torch.arange(num_tokens, device=routing_map.device).unsqueeze(1)
+    budget_expanded = budget.unsqueeze(0)
+    sorted_assignments = token_positions < budget_expanded
+    
+    # Step 3: Restore original token order using scatter
+    result = torch.zeros_like(routing_map)
+    result.scatter_(0, sort_indices, sorted_assignments)
+    return result
 
 def topk_routing_with_score_function(
     logits: torch.Tensor,

@@ -12,6 +12,7 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     apply_random_logits,
     apply_router_token_dropping,
+    pad_and_drop_routing_map,
     compute_routing_scores_for_aux_loss,
     router_gating_linear,
     save_to_aux_losses_tracker,
@@ -23,6 +24,7 @@ from megatron.core.transformer.moe.moe_utils import (
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
 )
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core import utils
 
@@ -210,11 +212,13 @@ class TopKRouter(Router):
         self.tp_size = utils.get_pg_size(self.tp_group)
         self.tp_rank = utils.get_pg_rank(self.tp_group)
         self.ep_size = utils.get_pg_size(self.ep_group)
-        self.num_global_tokens_per_expert = torch.empty((self.tp_size, self.ep_size, self.num_experts), device="cuda", dtype=torch.long)
-        self.num_global_tokens_per_expert_cpu = torch.empty((self.tp_size, self.ep_size, self.num_experts), device="cpu", pin_memory=True, dtype=torch.long)
+        self.num_tokens_per_expert_cpu = torch.empty((self.tp_size, self.ep_size, self.num_experts), device="cpu", pin_memory=True, dtype=torch.long)
         self.d2h_event = torch.cuda.Event(external=True)
         self.capacity_factor = self.config.moe_expert_capacity_factor
         self.pad_to_capacity = self.config.moe_pad_expert_input_to_capacity
+        self.speculative_cuda_graph_status = None
+        self.speculative_cuda_graph_capacity_factor = config.moe_expert_capacity_factor_for_speculative_cuda_graph
+        self.budget_global_cpu = torch.empty((self.tp_size, self.ep_size, self.num_experts), device="cpu", pin_memory=True, dtype=torch.long)
 
     def _maintain_float32_expert_bias(self):
         """
@@ -482,21 +486,32 @@ class TopKRouter(Router):
                     torch.tensor(1.0 - eps, device=input.device),
                     torch.tensor(1.0 + eps, device=input.device),
                 ).rsample
-            return input * self.input_jitter(input.shape)
+            return input + (self.input_jitter(input.shape).to(input.dtype))
         else:
             return input
 
-    def get_non_token_drop_stats(self, routing_map):
-        num_local_tokens_per_expert = routing_map.sum(dim=0).long()
-        num_global_tokens_per_expert = (
+    def get_non_token_drop_stats(self, routing_map, budget):
+        # TODO: we don't really need to allgather everything. We don't need to AG
+        # budget every iteration either. 
+        num_tokens_per_expert = routing_map.sum(dim=0)
+        num_tokens_per_expert = (
             gather_from_sequence_parallel_region(
-                num_local_tokens_per_expert, group=self.tp_ep_group
+                num_tokens_per_expert, group=self.tp_ep_group
             )
             .reshape(self.ep_size, self.tp_size, self.num_experts)
             .transpose(0, 1)
         )
-        # self.num_global_tokens_per_expert.copy_(num_global_tokens_per_expert)
-        self.num_global_tokens_per_expert_cpu.copy_(num_global_tokens_per_expert, non_blocking=True)
+
+        budget_global = (
+            gather_from_sequence_parallel_region(
+                budget, group=self.tp_ep_group
+            )
+            .reshape(self.ep_size, self.tp_size, self.num_experts)
+            .transpose(0, 1)
+        )
+
+        self.num_tokens_per_expert_cpu.copy_(num_tokens_per_expert, non_blocking=True)
+        self.budget_global_cpu.copy_(budget_global, non_blocking=True)
         torch.cuda.current_stream().record_event(self.d2h_event)
 
     def routing(self, logits: torch.Tensor):
@@ -531,7 +546,6 @@ class TopKRouter(Router):
                 expert_bias=self.expert_bias,
                 fused=self.config.moe_router_fusion,
             )
-        self.get_non_token_drop_stats(routing_map)
         # Apply token dropping to probs and routing_map.
         if self.capacity_factor is not None:
             probs, routing_map = apply_router_token_dropping(
@@ -562,6 +576,16 @@ class TopKRouter(Router):
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
+        if self.speculative_cuda_graph_status == "stats":
+            self.budget = (routing_map.sum(dim=0) * self.speculative_cuda_graph_capacity_factor).long()
+            if self.config.moe_router_padding_for_fp8:
+                pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
+                self.budget += -self.budget % pad_multiple
+            self.budget = self.budget.clamp(max=routing_map.shape[0])
+
+        if self.speculative_cuda_graph_status in ["warmup", "capture"]:
+            self.get_non_token_drop_stats(routing_map, self.budget)
+            routing_map = pad_and_drop_routing_map(routing_map, self.budget)
 
         return probs, routing_map
 
@@ -583,11 +607,13 @@ class TopKRouter(Router):
         # Apply input jitter
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
-
+        
         if self.config.moe_router_force_load_balancing:
             # Apply force load balancing with random logits for benchmark
             logits = apply_random_logits(logits)
+           
         probs, routing_map = self.routing(logits)
+        
         return probs, routing_map
 
     def _load_from_state_dict(self, *args, **kwargs):

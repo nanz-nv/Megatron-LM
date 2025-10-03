@@ -916,30 +916,18 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             return cuda_graph_func(*args, **kwargs)
         return super(MegatronModule, self).__call__(*args, **kwargs)
 
-    def set_knobs_for_spec_cuda_graph(self):
-        stashed_knobs = [
-            self.mlp.router.capacity_factor,
-            self.mlp.router.pad_to_capacity,
-            self.mlp.token_dispatcher.drop_and_pad,
-            self.mlp.token_dispatcher.moe_expert_capacity_factor,
-        ]
-        self.mlp.router.capacity_factor = self.config.moe_expert_capacity_factor_for_speculative_cuda_graph
-        self.mlp.router.pad_to_capacity = True
-        self.mlp.token_dispatcher.drop_and_pad = True
-        self.mlp.token_dispatcher.moe_expert_capacity_factor = self.config.moe_expert_capacity_factor_for_speculative_cuda_graph
-        return stashed_knobs
+    def set_spec_cuda_graph_status(self, status):
+        assert status in ["stats", "warmup", "capture", "execute"], f"Invalid status: {status}"
+        self.mlp.token_dispatcher.speculative_cuda_graph_status = status
+        self.mlp.router.speculative_cuda_graph_status = status
 
-    def resotre_knobs_for_spec_cuda_graph(self, stashed_knobs):
-        self.mlp.router.capacity_factor = stashed_knobs[0]
-        self.mlp.router.pad_to_capacity = stashed_knobs[1]
-        self.mlp.token_dispatcher.drop_and_pad = stashed_knobs[2]
-        self.mlp.token_dispatcher.moe_expert_capacity_factor = stashed_knobs[3]
 
 
     def require_eager_mode_fallback(self):
         self.mlp.router.d2h_event.synchronize()
-        num_global_tokens_per_expert = self.mlp.router.num_global_tokens_per_expert_cpu
-        max_ratio = num_global_tokens_per_expert.max() / num_global_tokens_per_expert.float().mean()
-        exceeding_threshold = max_ratio > self.config.moe_expert_capacity_factor_for_speculative_cuda_graph
-
-        return exceeding_threshold
+        over_budget = (self.mlp.router.num_tokens_per_expert_cpu > self.mlp.router.budget_global_cpu).any().item()
+        if torch.distributed.get_rank() == 0 and over_budget:
+            print(f"over_budget: {over_budget}", flush=True)
+            over_budget_magnitudes = self.mlp.router.num_tokens_per_expert_cpu.float()/self.mlp.router.budget_global_cpu.float()
+            print(f"over_budget_magnitudes: {over_budget_magnitudes[over_budget_magnitudes > 1.0]}", flush=True)
+        return over_budget

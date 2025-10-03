@@ -402,9 +402,9 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Token drop and padding.
         # Drop and pad the input to capacity.
         self.drop_and_pad = self.config.moe_pad_expert_input_to_capacity
-        # if self.drop_and_pad:
-        #     assert self.config.moe_expert_capacity_factor is not None
-        self.moe_expert_capacity_factor = self.config.moe_expert_capacity_factor
+        if self.drop_and_pad:
+            assert self.config.moe_expert_capacity_factor is not None
+            self.moe_expert_capacity_factor = self.config.moe_expert_capacity_factor
         self.capacity = None
 
         # A cuda stream synchronization is needed in during token permutation in some cases,
@@ -425,6 +425,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             MoEAlltoAllTokenDispatcher.cuda_dtoh_stream = torch.cuda.Stream()
 
         self.shared_experts = None
+        self.speculative_cuda_graph_status = None
+        self.speculative_cuda_graph_capacity_factor = config.moe_expert_capacity_factor_for_speculative_cuda_graph
 
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
@@ -576,15 +578,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         assert routing_map.dim() == 2, "Expected 2D tensor for token2expert mask"
         assert routing_map.dtype == torch.bool, "Expected bool tensor for mask"
         hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
-
         if self.config.moe_router_padding_for_fp8:
             pad_multiple = get_fp8_align_size(self.config.fp8_recipe)
             if is_experimental_enabled() and self.config.moe_permute_fusion:
                 self.routing_map = fused_pad_routing_map(self.routing_map, pad_multiple)
             else:
-                self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
+                self.routing_map = pad_routing_map(self.routing_map.detach().clone(), pad_multiple)
+                
         self.tokens_per_expert = self.preprocess(self.routing_map)
-
         if self.shared_experts is not None:
             self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
 
@@ -830,6 +831,14 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         """
         if not self.drop_and_pad:
             if point == self.cuda_dtoh_point:
+                if self.speculative_cuda_graph_status == "capture":
+                    tokens_per_expert = self.tokens_per_expert_cached
+                    self.input_splits = self.input_splits_cached
+                    self.output_splits = self.output_splits_cached
+                    self.output_splits_tp = self.output_splits_tp_cached
+                    self.num_out_tokens = self.num_out_tokens_cached
+                    self.num_global_tokens_per_local_expert = self.num_global_tokens_per_local_expert_cached
+                    return tokens_per_expert
                 # Move all possible GPU tensors to CPU at self.cuda_dtoh_point.
                 on_side_stream = torch.cuda.current_stream() != self.cuda_dtoh_stream
                 if on_side_stream:
@@ -860,6 +869,15 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             if point == self.cuda_sync_point:
                 # Synchronize with the DtoH stream at self.cuda_sync_point.
                 self.d2h_event.synchronize()
+
+                if self.speculative_cuda_graph_status == "warmup":
+                    self.tokens_per_expert_cached = tokens_per_expert
+                    self.input_splits_cached = self.input_splits
+                    self.output_splits_cached = self.output_splits
+                    self.output_splits_tp_cached = self.output_splits_tp
+                    self.num_out_tokens_cached = self.num_out_tokens
+                    self.num_global_tokens_per_local_expert_cached = self.num_global_tokens_per_local_expert
+
 
         return tokens_per_expert
 

@@ -265,7 +265,6 @@ class _CudagraphGlobalRecord:
             if optimize_transformer_layer_graph_buffers:
                 if graph_type == 'fwd':
                     args, kwargs = g[2:]
-
                     if not runner.is_first_layer:
                         kwargs['hidden_states'] = prev_fwd_hidden_state_output
                     runner.create_fwd_graph(args, kwargs, clone_inputs=False)
@@ -291,6 +290,7 @@ class _CudagraphGlobalRecord:
             else:
                 runner, graph_type = g[0:2]
                 if graph_type == 'fwd':
+                    
                     args, kwargs = g[2:]
                     runner.create_fwd_graph(args, kwargs)
                 else:
@@ -664,9 +664,8 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fwd_graph.register_generator_state(state)
 
 
-        # Optionally setup knobs for speculative CUDA graph
         if self.base_module.config.moe_expert_capacity_factor_for_speculative_cuda_graph is not None:
-            stashed_token_drop_knobs = self.base_module.set_knobs_for_spec_cuda_graph()
+            self.base_module.set_spec_cuda_graph_status("warmup")
         # warmup again as case graph capture mode may execute a different codepath
         for _ in range(self.num_warmup_steps):
             with self.get_quantization_context():
@@ -684,7 +683,8 @@ class _CudaGraphRunner(torch.nn.Module):
                     only_inputs=True,
                     allow_unused=True,
                 )
-
+        if self.base_module.config.moe_expert_capacity_factor_for_speculative_cuda_graph is not None:
+            self.base_module.set_spec_cuda_graph_status("capture")
         with self.get_quantization_context():
             torch.cuda.synchronize()
             with torch.cuda.graph(
@@ -692,9 +692,8 @@ class _CudaGraphRunner(torch.nn.Module):
             ):
                 outputs = self.base_module.forward(*args, **kwargs)
 
-        # Optionally restore knobs for speculative CUDA graph
         if self.base_module.config.moe_expert_capacity_factor_for_speculative_cuda_graph is not None:
-            self.base_module.resotre_knobs_for_spec_cuda_graph(stashed_token_drop_knobs)
+            self.base_module.set_spec_cuda_graph_status("execute")
 
         # save cudagraph output buffer
         if isinstance(outputs, torch.Tensor):
@@ -861,6 +860,7 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fwd_graph_recorded = True
 
         # Run the forward pass as normal in eager mode.
+        self.base_module.set_spec_cuda_graph_status("stats")
         out = super(MegatronModule, self.base_module).__call__(*args, **kwargs)
 
         if type(out) != tuple:
