@@ -5,6 +5,7 @@ from collections import deque
 from contextlib import nullcontext
 from typing import Any
 import os
+import pdb
 import torch
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 try:
@@ -16,7 +17,7 @@ except ImportError:
 
 # Packed Moe Expert Offload implementation for pipeline parallelism
 DEBUG = False
-DEBUG_RANK = [0]
+DEBUG_RANK = [2]
 def debug_print(message):
     """Print debug message for a specific rank when DEBUG is enabled."""
     # pylint: disable=bad-builtin
@@ -299,10 +300,10 @@ class PagedStashBuffer:
         
         # Head and tail pointers for free_list circular buffer
         self.free_list_head = torch.zeros(1, dtype=torch.int64, device=device)  # Read pointer (allocation)
-        self.free_list_tail = torch.tensor([self.num_pages], dtype=torch.int64, device=device)  # Write pointer (deallocation)
+        self.free_list_tail = self.num_pages * torch.ones(1, dtype=torch.int64, device=device)  # Write pointer (deallocation)
         
         # Capacity of free list
-        self.free_list_capacity = torch.tensor([self.num_pages], dtype=torch.int64, device=device)
+        self.free_list_capacity = self.num_pages * torch.ones(1, dtype=torch.int64, device=device)
     
     def reset(self):
         """Reset the paged buffer - reinitialize free list."""
@@ -757,6 +758,17 @@ class PagedTensor:
             # Create temporary tensor for new head
             new_free_list_head = torch.empty(1, dtype=torch.int64, device=self.device)
             
+            # Validate free list contains valid page IDs
+            # required_pages = (triton_num_tokens.item() + self.page_size - 1) // self.page_size
+            # free_list_head_val = paged_stash_buffer.free_list_head.item()
+            # for i in range(required_pages):
+            #     free_list_idx = (free_list_head_val + i) % paged_stash_buffer.free_list_capacity.item()
+            #     page_id = paged_stash_buffer.free_list[free_list_idx].item()
+            #     assert 0 <= page_id < paged_stash_buffer.num_pages, \
+            #         f"Invalid page_id in free_list[{free_list_idx}] = {page_id}, expected [0, {paged_stash_buffer.num_pages})"
+            
+            # Debug print before kernel launch
+            
             # Launch paged stash copy kernel
             _paged_stash_copy_kernel[grid](
                 triton_tensor,
@@ -773,6 +785,16 @@ class PagedTensor:
                 HIDDEN_SIZE=self.hidden_size,
                 BLOCK_SIZE=BLOCK_SIZE,
             )
+
+            if DEBUG:
+                manager = PackedOffloadManager.get_instance()
+                required_pages_debug = (triton_num_tokens.item() + self.page_size - 1) // self.page_size
+                debug_print(f"[DEBUG AFTER COPY KERNEL - Iteration {manager.iteration}] Layer: {self.layer_name}")
+                debug_print(f"  triton_num_tokens: {triton_num_tokens.item()}")
+                debug_print(f"  required_pages: {required_pages_debug}")
+                debug_print(f"  free_list_head: {paged_stash_buffer.free_list_head.item()}")
+                debug_print(f"  free_list_tail: {paged_stash_buffer.free_list_tail.item()}")
+                debug_print(f"  page_record[0:{required_pages_debug}] (before): {self.page_record[:required_pages_debug].tolist()}")
             
             # Update free list head
             paged_stash_buffer.free_list_head.copy_(new_free_list_head)
@@ -844,7 +866,27 @@ class PagedTensor:
             # Create temporary tensor for new tail
             new_free_list_tail = torch.empty(1, dtype=torch.int64, device=self.device)
             
+            # Validate page_record contains valid page IDs
+            # required_pages = (triton_num_tokens.item() + self.page_size - 1) // self.page_size
+            # for i in range(required_pages):
+            #     page_id = self.page_record[i].item()
+            #     assert 0 <= page_id < paged_stash_buffer.num_pages, \
+            #         f"Invalid page_id in page_record[{i}] = {page_id}, expected [0, {paged_stash_buffer.num_pages})"
+            
+            # Debug print before kernel launch
+            manager = PackedOffloadManager.get_instance()
+            if DEBUG:
+                required_pages_debug = (triton_num_tokens.item() + self.page_size - 1) // self.page_size
+                debug_print(f"[DEBUG BEFORE POP KERNEL - Iteration {manager.iteration}] Layer: {self.layer_name}")
+                debug_print(f"  triton_num_tokens: {triton_num_tokens.item()}")
+                debug_print(f"  required_pages: {required_pages_debug}")
+                debug_print(f"  free_list_head: {paged_stash_buffer.free_list_head.item()}")
+                debug_print(f"  free_list_tail: {paged_stash_buffer.free_list_tail.item()}")
+                debug_print(f"  page_record[0:{required_pages_debug}]: {self.page_record[:required_pages_debug].tolist()}")
+            
             # Launch paged stash pop kernel
+            # if torch.distributed.get_rank() == 2 and manager.iteration == 121: pdb.set_trace()
+            # torch.distributed.barrier()
             _paged_stash_pop_kernel[grid](
                 paged_stash_buffer.buffer,
                 triton_tensor,
@@ -1051,7 +1093,8 @@ class PackedOffloadManager:
         current_stream = torch.cuda.current_stream()
         self.pack_stream.wait_stream(current_stream)
 
-        with torch.cuda.stream(self.pack_stream):
+        # with torch.cuda.stream(self.pack_stream):
+        with torch.cuda.stream(current_stream):
             if self.status == 'captured':
                 self._pack_stream_status = 'offloading'
                 #assert self.packed_tensors_to_reload
@@ -1079,7 +1122,8 @@ class PackedOffloadManager:
         current_stream = torch.cuda.current_stream()
         self.unpack_stream.wait_stream(current_stream)
 
-        with torch.cuda.stream(self.unpack_stream):
+        # with torch.cuda.stream(self.unpack_stream):
+        with torch.cuda.stream(current_stream):
             if self.status == 'captured':
                 self._unpack_stream_status = 'reloading'
                 count = 0

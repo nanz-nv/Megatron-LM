@@ -188,15 +188,106 @@ class FullCudaGraphWrapper:
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
-            packed_moe_expert_offloading_reset(enabled=self.packed_moe_expert_offloading and training)
+            # packed_moe_expert_offloading_reset(enabled=self.packed_moe_expert_offloading and training)
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
+        list_max0 = []
+        list_max1 = []
+        list_max2 = []
+        list_max3 = []
+        list_num_tokens = []
+        # Flag to track if condition is met on any rank
+        condition_met = torch.zeros(1, dtype=torch.bool, device='cuda')
+        
+        for model_chunk in model:
+            for layer in model_chunk.module.module.decoder.layers:
+                mlp = layer.mlp
+                if hasattr(mlp, 'token_dispatcher') and hasattr(mlp.token_dispatcher, '_comm_manager'):
+                    for i, x in enumerate(mlp.token_dispatcher._comm_manager.list_record_fwd):
+                        num_tokens = mlp.token_dispatcher._comm_manager.list_record_m[i].sum().item()
+                        list_num_tokens.append(num_tokens)
+                        if num_tokens > 0:
+                            list_max0.append(mlp.token_dispatcher._comm_manager.list_record_fwd[i][0][:num_tokens].abs().max().item())
+                            list_max1.append(mlp.token_dispatcher._comm_manager.list_record_fwd[i][1].abs().max().item())
+                            list_max2.append(mlp.token_dispatcher._comm_manager.list_record_bwd[i][0].abs().max().item())
+                            list_max3.append(mlp.token_dispatcher._comm_manager.list_record_bwd[i][1][:num_tokens].abs().max().item())
+                            if torch.distributed.get_rank() == 15 and mlp.token_dispatcher._comm_manager.list_record_bwd[i][1][:num_tokens].abs().max().item() > 0.01:
+                                condition_met.fill_(True)
+        
+        # Allreduce to notify all GPUs if condition was met on any rank
+        torch.distributed.all_reduce(condition_met, op=torch.distributed.ReduceOp.MAX)
+        
+        if condition_met.item():
+            # Collect all tensors for debugging
+            debug_data = {
+                'list_max0': list_max0,
+                'list_max1': list_max1,
+                'list_max2': list_max2,
+                'list_max3': list_max3,
+                'list_num_tokens': list_num_tokens,
+                'model_chunks': []
+            }
+            
+            for model_chunk_i, model_chunk in enumerate(model):
+                chunk_data = {'chunk_id': model_chunk_i, 'layers': []}
+                for layer_i, layer in enumerate(model_chunk.module.module.decoder.layers):
+                    mlp = layer.mlp
+                    if hasattr(mlp, 'token_dispatcher') and hasattr(mlp.token_dispatcher, '_comm_manager'):
+                        comm_manager = mlp.token_dispatcher._comm_manager
+                        layer_data = {
+                            'layer_id': layer_i,
+                            'records': []
+                        }
+                        
+                        for i, x in enumerate(comm_manager.list_record_fwd):
+                            num_tokens = comm_manager.list_record_m[i].sum().item()
+                            record = {
+                                'record_id': i,
+                                'num_tokens': num_tokens,
+                                'list_record_fwd': [t.detach().cpu() for t in comm_manager.list_record_fwd[i]],
+                                'list_record_bwd': [t.detach().cpu() for t in comm_manager.list_record_bwd[i]],
+                                'list_record_m': comm_manager.list_record_m[i].detach().cpu(),
+                            }
+                            layer_data['records'].append(record)
+                        
+                        chunk_data['layers'].append(layer_data)
+                debug_data['model_chunks'].append(chunk_data)
+            
+            # Save to file
+            rank = torch.distributed.get_rank()
+            filename = f'/lustre/fsw/coreai_mlperf_training/users/nanz/moe/megatron-moe-scripts/results/debug_tensors_rank{rank}_iter{FullCudaGraphWrapper.curr_iteration[training_str]}.pt'
+            torch.save(debug_data, filename)
+            logger.info(f'Rank {rank}: Saved debug tensors to {filename}')
+            print(f'Rank {rank}: Saved debug tensors to {filename}', flush=True)
+            
+
+        # if torch.distributed.get_rank() == 0: import pdb; pdb.set_trace()
+        # print(f"Rank {torch.distributed.get_rank()}: num_tokens {list_num_tokens}", flush=True)
+        # print(f"Rank {torch.distributed.get_rank()}: fwd 0 {list_max0}", flush=True)
+        # print(f"Rank {torch.distributed.get_rank()}: fwd 1 {list_max1}", flush=True)
+        # print(f"Rank {torch.distributed.get_rank()}: bwd 0 {list_max2}", flush=True)
+        # print(f"Rank {torch.distributed.get_rank()}: bwd 1 {list_max3}", flush=True)
+        if FullCudaGraphWrapper.cuda_graph[training_str] is None:
+            if curr_iteration < self.cuda_graph_warmup_steps - 1:
+                for model_chunk in model:
+                    for layer in model_chunk.module.module.decoder.layers:
+                        mlp = layer.mlp
+                        if hasattr(mlp, 'token_dispatcher') and hasattr(mlp.token_dispatcher, '_comm_manager'):
+                            mlp.token_dispatcher._comm_manager.list_record_fwd = []
+                            mlp.token_dispatcher._comm_manager.list_record_bwd = []
+                            mlp.token_dispatcher._comm_manager.list_record_m = []
+                            mlp.token_dispatcher._comm_manager.index_fwd = 0
+                            mlp.token_dispatcher._comm_manager.index_bwd = 0
+                            mlp.token_dispatcher._comm_manager.index_fwd_g = [0]
+                            mlp.token_dispatcher._comm_manager.index_bwd_g = [0]
+
+            # if torch.distributed.get_rank() == 0: import pdb; pdb.set_trace()
         self.speculative_cuda_graph_check(model)
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
 
     def speculative_cuda_graph_check(self, model):
         ''' check speculative execution modules '''
-        if self.packed_moe_expert_offloading:
+        if self.packed_moe_expert_offloading is not None:
             # Check if there is any overflow in the receiving buffer
             over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
             for model_chunk in model:

@@ -588,7 +588,6 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         timers = self.config.timers
-
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
@@ -1308,7 +1307,8 @@ class ChainedOptimizer(MegatronOptimizer):
             return False, None, None
 
         grad_norm = self.get_grad_norm()
-
+        # if grad_norm > 30 and torch.distributed.get_rank() == 0:
+        #     import pdb; pdb.set_trace()
         # Clip gradients.
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:

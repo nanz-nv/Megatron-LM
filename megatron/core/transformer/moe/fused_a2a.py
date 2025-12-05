@@ -338,6 +338,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_dispatched_tokens=None,
         num_permuted_tokens=None,
         pad_multiple=None,
+        list_record=None,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -381,6 +382,7 @@ class HybridEPDispatch(torch.autograd.Function):
         ctx.handle = handle
         ctx.pad_multiple = pad_multiple
         ctx.num_dispatched_tokens = num_dispatched_tokens
+        ctx.list_record = list_record + [tokens_per_expert.sum()] + [routing_map]
         return (
             dispatched_hidden,
             dispatched_probs,
@@ -402,7 +404,18 @@ class HybridEPDispatch(torch.autograd.Function):
             pad_multiple=ctx.pad_multiple,
             num_dispatched_tokens=ctx.num_dispatched_tokens,
         )
-        return combined_hidden, None, combined_probs, None, None, None, None, None, None, None
+        list_record_fwd, list_record_m, index_fwd_g, num_tokens, routing_map = ctx.list_record
+        if not torch.cuda.graphs.is_current_stream_capturing():
+            list_record_fwd.append([grad_x.detach(), combined_hidden.detach(), routing_map])
+            list_record_m.append(num_tokens)
+        else:
+            list_record_fwd[index_fwd_g[0]][0].copy_(grad_x.detach())
+            list_record_fwd[index_fwd_g[0]][1].copy_(combined_hidden.detach())
+            list_record_fwd[index_fwd_g[0]][2].copy_(routing_map.detach())
+            list_record_m[index_fwd_g[0]].copy_(num_tokens)
+            index_fwd_g[0] += 1
+
+        return combined_hidden, None, combined_probs, None, None, None, None, None, None, None, None
 
 
 class HybridEPCombine(torch.autograd.Function):
@@ -412,7 +425,7 @@ class HybridEPCombine(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx, x, handle, num_dispatched_tokens=None, num_permuted_tokens=None, pad_multiple=None
+        ctx, x, handle, num_dispatched_tokens=None, num_permuted_tokens=None, pad_multiple=None, list_record=None
     ):
         '''
         Forward pass of fused combine of the HybridEP backend
@@ -427,6 +440,7 @@ class HybridEPCombine(torch.autograd.Function):
         ctx.pad_multiple = pad_multiple
         ctx.num_dispatched_tokens = num_dispatched_tokens
         ctx.num_permuted_tokens = num_permuted_tokens
+        ctx.list_record = list_record
         return combined_hidden
 
     @staticmethod
@@ -443,7 +457,14 @@ class HybridEPCombine(torch.autograd.Function):
             num_dispatched_tokens=ctx.num_dispatched_tokens,
             num_permuted_tokens=ctx.num_permuted_tokens,
         )
-        return dispatched_hidden, None, None, None, None
+        list_record_bwd, index_bwd_g = ctx.list_record
+        if not torch.cuda.graphs.is_current_stream_capturing():
+            list_record_bwd.append([grad_x.detach(), dispatched_hidden.detach()])
+        else:
+            list_record_bwd[index_bwd_g[0]][0].copy_(grad_x.detach())
+            list_record_bwd[index_bwd_g[0]][1].copy_(dispatched_hidden.detach())
+            index_bwd_g[0] += 1
+        return dispatched_hidden, None, None, None, None, None
 
 
 if HAVE_HYBRIDEP:
@@ -459,6 +480,7 @@ if HAVE_HYBRIDEP:
         num_dispatched_tokens=None,
         num_permuted_tokens=None,
         pad_multiple=None,
+        list_record=None,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -502,9 +524,10 @@ if HAVE_HYBRIDEP:
             num_dispatched_tokens,
             num_permuted_tokens,
             pad_multiple,
+            list_record,
         )
 
-    def hybrid_ep_combine(x, handle, num_dispatched_tokens, num_permuted_tokens, pad_multiple):
+    def hybrid_ep_combine(x, handle, num_dispatched_tokens, num_permuted_tokens, pad_multiple, list_record):
         '''
         Perform fused combine operation for unpermute + combine a2a + unpermute
         using the HybridEP backend
@@ -526,7 +549,7 @@ if HAVE_HYBRIDEP:
                 is performed.
         '''
         return HybridEPCombine.apply(
-            x, handle, num_dispatched_tokens, num_permuted_tokens, pad_multiple
+            x, handle, num_dispatched_tokens, num_permuted_tokens, pad_multiple, list_record
         )
 
 else:

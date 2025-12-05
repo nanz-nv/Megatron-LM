@@ -1015,6 +1015,9 @@ class _HybridEPManager(_DispatchManager):
 
         self.packed_offloading_capacity_factor = self.config.moe_expert_capacity_factor_for_packed_offloading
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+        self.list_record_fwd, self.list_record_bwd, self.list_record_m = [], [], []
+        self.index_fwd, self.index_bwd = 0, 0
+        self.index_fwd_g, self.index_bwd_g = [0], [0]
 
     def budget_check(self, routing_map, budget):
         # TODO: the check should be done in hybridep to avoid the AG below
@@ -1068,6 +1071,10 @@ class _HybridEPManager(_DispatchManager):
             self.tokens_per_expert = torch.full(
                 (self.num_local_experts,), self.capacity * self.group.size(), dtype=torch.long
             )
+        # budget = int(routing_map.shape[0] * self.config.moe_router_topk  * 2)
+        # routing_map_maybe_dropped, over_budget = self.budget_check(routing_map, budget)
+        # if over_budget.item():
+        #     raise Exception(f"Rank {torch.distributed.get_rank()} overbudget")
 
     def dispatch(
         self,
@@ -1097,14 +1104,30 @@ class _HybridEPManager(_DispatchManager):
                 num_dispatched_tokens=self.num_dispatched_tokens,
                 num_permuted_tokens=self.num_permuted_tokens,
                 pad_multiple=self.pad_multiple,
+                list_record = [self.list_record_fwd, self.list_record_m, self.index_fwd_g],
             )
         )
-
+        # if not torch.cuda.graphs.is_current_stream_capturing():
+        #     self.list_record_fwd.append([hidden_states.detach(), dispatched_hidden.detach()])
+        #     self.list_record_m.append(tokens_per_expert.detach())
+        #     # if torch.distributed.get_rank() == 0: import pdb; pdb.set_trace()
+        #     # if torch.distributed.get_rank() == 0: 
+        #     #     if tokens_per_expert[0] == 4608 and tokens_per_expert[1] == 4096 and tokens_per_expert[2] == 4480 and tokens_per_expert[3] == 2560 and tokens_per_expert[4] == 5120 and tokens_per_expert[5] == 4608 and tokens_per_expert[6] == 4480 and tokens_per_expert[7] == 3584:
+        #     #         import pdb; pdb.set_trace()
+        #     # if dispatched_hidden[:tokens_per_expert.sum()].abs().max().item() > 100:
+        #     #     import pdb; pdb.set_trace()
+        # else:
+        #     self.list_record_fwd[self.index_fwd][0].copy_(hidden_states.detach())
+        #     self.list_record_fwd[self.index_fwd][1].copy_(dispatched_hidden.detach())
+        #     self.list_record_m[self.index_fwd].copy_(tokens_per_expert.detach())
+        #     self.index_fwd += 1
+            
+        
         if self.num_permuted_tokens is None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # self.num_permuted_tokens is necessary to allocate the output tensor for permute
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-        if self.config.moe_expert_capacity_factor_for_packed_offloading is not None:
+        if self.config.moe_expert_capacity_factor_for_packed_offloading or self.drop_and_pad:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
@@ -1114,18 +1137,29 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
-        hidden_states = hybrid_ep_combine(
+        hidden_states_out = hybrid_ep_combine(
             x=hidden_states,
             handle=self.handle,
             num_dispatched_tokens=self.num_dispatched_tokens,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
+            list_record = [self.list_record_bwd, self.index_bwd_g],
         )
+        # if not torch.cuda.graphs.is_current_stream_capturing():
+        #     self.list_record_bwd.append([hidden_states.detach(), hidden_states_out.detach()])
+        #     if hidden_states[:self.tokens_per_expert.sum()].abs().max().item() > 100:
+        #         import pdb; pdb.set_trace()
+        # else:
+        #     self.list_record_bwd[self.index_bwd][0].copy_(hidden_states.detach())
+        #     self.list_record_bwd[self.index_bwd][1].copy_(hidden_states_out.detach())
+        #     self.index_bwd += 1
+            
+        
         # Release the used handle/num_permuted_tokens which could change in each iteration
         self.handle = None
         self.num_permuted_tokens = None
         self.num_dispatched_tokens = None
-        return hidden_states
+        return hidden_states_out
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return hidden_states, self.dispatched_probs

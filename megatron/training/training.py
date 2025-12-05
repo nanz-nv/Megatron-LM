@@ -1403,7 +1403,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    # if torch.distributed.get_rank() == 0: import pdb; pdb.set_trace()
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    # for i, model_chunk in enumerate(model):
+    #     for name, param in model_chunk.named_parameters():
+    #         if param.main_grad is not None:
+    #             print(f"Rank {torch.distributed.get_rank()}: {i} {name} {torch.norm(param.main_grad, 2).item()}", flush=True)
     timers('optimizer').stop()
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
@@ -2236,7 +2241,7 @@ def train(
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
     if args.cuda_graph_impl == "local" and "full_iteration" in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps, packed_moe_expert_offloading=args.packed_moe_expert_offloading)
+        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps, packed_moe_expert_offloading=args.moe_expert_capacity_factor_for_packed_offloading is not None)
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""

@@ -131,7 +131,7 @@ def get_grad_norm_fp32(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
         total_norm = total_norm.item() ** (1.0 / norm_type)
-
+    # if torch.distributed.get_rank() == 0: import pdb; pdb.set_trace()
     return total_norm
 
 
