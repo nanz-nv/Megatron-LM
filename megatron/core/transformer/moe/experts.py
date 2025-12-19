@@ -32,12 +32,6 @@ from megatron.core.jit import jit_fuser
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
-from megatron.core.transformer.moe.paged_stash import (
-    paged_stash_group_start,
-    get_paged_stash_context,
-    paged_stash_reset,
-    paged_stash_group_commit,
-)
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
     _initialize_affine_weight_gpu,
@@ -55,6 +49,11 @@ from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
+)
+from megatron.core.transformer.moe.paged_stash import (
+    get_paged_stash_context,
+    paged_stash_group_commit,
+    paged_stash_group_start,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
@@ -705,9 +704,13 @@ class TEGroupedMLP(MegatronModule):
         )
 
         stash_modules = self.config.stash_modules or []
-        self.moe_paged_stash_expert_fc1 = self.config.moe_paged_stash and "expert_fc1" in stash_modules
+        self.moe_paged_stash_expert_fc1 = (
+            self.config.moe_paged_stash and "expert_fc1" in stash_modules
+        )
         self.moe_paged_stash_moe_act = self.config.moe_paged_stash and "moe_act" in stash_modules
-        self.moe_paged_stash_expert_fc2 = self.config.moe_paged_stash and "expert_fc2" in stash_modules
+        self.moe_paged_stash_expert_fc2 = (
+            self.config.moe_paged_stash and "expert_fc2" in stash_modules
+        )
 
         self.activation_recompute = (
             self.config.recompute_granularity == 'selective'
@@ -770,14 +773,19 @@ class TEGroupedMLP(MegatronModule):
             tokens_per_expert = tokens_per_expert.long().cuda()
         else:
             tokens_per_expert: list[int] = tokens_per_expert.tolist()
-        
+
         actual_tokens_per_expert = tokens_per_expert
         if self.config.fp8 or self.config.fp4:
             if self.config.fp8 and self.config.moe_use_device_initiated_grouped_gemm:
-                assert self.config.moe_router_padding_for_fp8, "Should set --moe-router-padding-for-fp8 to use router padding for fp8 when enabled device-initiated grouped gemm."
+                assert self.config.moe_router_padding_for_fp8, (
+                    "Should set --moe-router-padding-for-fp8 to use router padding for fp8 "
+                    "when enabled device-initiated grouped gemm."
+                )
                 permuted_probs = permuted_probs.unsqueeze(-1)
             else:
-                assert not self.config.moe_use_device_initiated_grouped_gemm, "--moe-use-device-initiated-grouped-gemm not supported for FP4"
+                assert (
+                    not self.config.moe_use_device_initiated_grouped_gemm
+                ), "--moe-use-device-initiated-grouped-gemm not supported for FP4"
                 permuted_local_hidden_states, tokens_per_expert = self.quantization_padding(
                     permuted_local_hidden_states, tokens_per_expert
                 )
@@ -801,9 +809,15 @@ class TEGroupedMLP(MegatronModule):
             self.offload_expert_fc1, permuted_local_hidden_states, "expert_fc1"
         ) as permuted_local_hidden_states:
             if self.config.moe_paged_stash:
-                permuted_local_hidden_states = paged_stash_group_start(permuted_local_hidden_states, name="expert_fc1")
+                permuted_local_hidden_states = paged_stash_group_start(
+                    permuted_local_hidden_states, name="expert_fc1"
+                )
             if self.moe_paged_stash_expert_fc1:
-                offload_context = get_paged_stash_context(name="expert_fc1", max_num_tokens=permuted_local_hidden_states.shape[0], num_tokens_tensor=tokens_per_expert.sum())
+                offload_context = get_paged_stash_context(
+                    name="expert_fc1",
+                    max_num_tokens=permuted_local_hidden_states.shape[0],
+                    num_tokens_tensor=tokens_per_expert.sum(),
+                )
             else:
                 offload_context = nullcontext()
             with offload_context:
@@ -834,10 +848,14 @@ class TEGroupedMLP(MegatronModule):
                         bias_parallel,
                         permuted_probs,
                         self.config.activation_func_fp8_input_store,
-                        tokens_per_expert.sum()
-                        if (isinstance(tokens_per_expert, torch.Tensor) and tokens_per_expert.is_cuda)
-                        else None,
-
+                        (
+                            tokens_per_expert.sum()
+                            if (
+                                isinstance(tokens_per_expert, torch.Tensor)
+                                and tokens_per_expert.is_cuda
+                            )
+                            else None
+                        ),
                     )
                 elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
                     intermediate_parallel = weighted_bias_quick_geglu_impl(
@@ -888,7 +906,11 @@ class TEGroupedMLP(MegatronModule):
         else:
             with off_interface(self.offload_moe_act, fc1_output, "moe_act") as fc1_output:
                 if self.moe_paged_stash_moe_act:
-                    offload_context = get_paged_stash_context(name="moe_act", max_num_tokens=fc1_output.shape[0], num_tokens_tensor=tokens_per_expert.sum())
+                    offload_context = get_paged_stash_context(
+                        name="moe_act",
+                        max_num_tokens=fc1_output.shape[0],
+                        num_tokens_tensor=tokens_per_expert.sum(),
+                    )
                 else:
                     offload_context = nullcontext()
                 with offload_context:
@@ -899,7 +921,11 @@ class TEGroupedMLP(MegatronModule):
             )
 
         if self.moe_paged_stash_expert_fc2:
-            offload_context = get_paged_stash_context(name="expert_fc2", max_num_tokens=bias_act_output.shape[0], num_tokens_tensor=tokens_per_expert.sum())
+            offload_context = get_paged_stash_context(
+                name="expert_fc2",
+                max_num_tokens=bias_act_output.shape[0],
+                num_tokens_tensor=tokens_per_expert.sum(),
+            )
         else:
             offload_context = nullcontext()
         with offload_context:
@@ -920,9 +946,14 @@ class TEGroupedMLP(MegatronModule):
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
             if self.config.fp8 and self.config.moe_use_device_initiated_grouped_gemm:
-                assert self.config.moe_router_padding_for_fp8, "Should set --moe-router-padding-for-fp8 to use router padding for fp8 when enabled device-initiated grouped gemm."
+                assert self.config.moe_router_padding_for_fp8, (
+                    "Should set --moe-router-padding-for-fp8 to use router padding for fp8 "
+                    "when enabled device-initiated grouped gemm."
+                )
             else:
-                assert not self.config.moe_use_device_initiated_grouped_gemm, "--moe-use-device-initiated-grouped-gemm not supported for FP4."
+                assert (
+                    not self.config.moe_use_device_initiated_grouped_gemm
+                ), "--moe-use-device-initiated-grouped-gemm not supported for FP4."
                 output = self.quantization_unpadding(output, actual_tokens_per_expert)
 
         output_bias = None
