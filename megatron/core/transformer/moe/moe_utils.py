@@ -1046,6 +1046,15 @@ def save_overload_factor_to_tracker(
     """
     # Set comm groups in tracker (outside autograd function)
     tracker = get_overload_factor_tracker()
+    if "to_clear" in tracker and tracker["to_clear"]:
+        if "fwd" in tracker:
+            tracker["fwd"].clear()
+        if "fwd_bwd" in tracker:
+            tracker["fwd_bwd"].clear()
+        tracker.pop("tp_ep_group", None)
+        tracker.pop("dp_group", None)
+        tracker.pop("to_clear", None)
+
     if "tp_ep_group" not in tracker:
         tracker["tp_ep_group"] = tp_ep_group
         tracker["dp_group"] = dp_group
@@ -1093,7 +1102,6 @@ def get_overload_factors_for_logging() -> dict:
     # Stack fwd_bwd tensors (already has fwd positive, bwd negative)
     fwd_bwd_tensors = tracker.get("fwd_bwd", [])
     fwd_bwd_tensors_stacked = torch.stack(fwd_bwd_tensors, dim=0) if fwd_bwd_tensors else None
-
     # All-reduce across tp_ep_group, cumsum, and find max
     max_cum_overload_factor = None
     if fwd_bwd_tensors_stacked is not None:
@@ -1163,12 +1171,7 @@ def get_overload_factors_for_logging() -> dict:
 def clear_overload_factor_tracker():
     """Clear the overload factor tracker."""
     tracker = get_overload_factor_tracker()
-    if "fwd" in tracker:
-        tracker["fwd"].clear()
-    if "fwd_bwd" in tracker:
-        tracker["fwd_bwd"].clear()
-    tracker.pop("tp_ep_group", None)
-    tracker.pop("dp_group", None)
+    tracker["to_clear"] = True
 
 
 @deprecated(
