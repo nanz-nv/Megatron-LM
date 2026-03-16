@@ -395,6 +395,10 @@ class TransformerConfig(ModelParallelConfig):
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
 
+    use_transformer_engine_op_fuser: bool = False
+    """If True, submodules may use Transformer Engine's operation fuser
+    API to enable advanced fusions."""
+
     ####################
     # activation recomputation
     ####################
@@ -773,6 +777,16 @@ class TransformerConfig(ModelParallelConfig):
     moe_expert_rank_capacity_factor: Optional[float] = None
     """The capacity factor for each expert, None means no token will be dropped.
     The default is None."""
+
+    moe_mlp_glu_interleave_size: Optional[int] = None
+    """When set, GLU activations in the MoE grouped MLP layer will use a
+    block interleaved format. Instead of interpreting the input tensor
+    as a concatenation of gates and linear units, it will be
+    interpreted as alternating blocks of gates and linear units.
+
+    This data format is experimental and primarily intended to enable
+    advanced fused kernels."""
+
     ##################
     # Context Parallel
     ##################
