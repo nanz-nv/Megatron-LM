@@ -774,7 +774,7 @@ class TransformerConfig(ModelParallelConfig):
     advanced fused kernels."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert, None means no token
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank, None means no token
     will be dropped. The default is None."""
 
     ##################
@@ -1480,7 +1480,7 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
-        if self.moe_paged_stash:# vasu
+        if self.moe_paged_stash:
             assert (
                 self.stash_modules is not None and len(self.stash_modules) > 0
             ), "stash_modules must be specified when moe_paged_stash is enabled."
