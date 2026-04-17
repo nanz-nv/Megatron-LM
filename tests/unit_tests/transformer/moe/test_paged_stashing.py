@@ -184,19 +184,43 @@ def is_hybrid_ep_available():
 
 
 def _te_grouped_mlp_op_fuser_environment_supported() -> bool:
-    """Cheap gate matching the start of ``TEGroupedMLP._is_fused_impl_supported`` (experts.py)."""
+    """Cheap gate matching the start of TEGroupedMLP._is_fused_impl_supported (experts.py).
+
+    These tests run MXFP8 + CuTe DSL grouped MLP fusion; TE only registers that path when
+    ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8.is_supported() and
+    BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8.is_supported() are true (see TE
+    ops/fused/forward_grouped_mlp.py and ops/fused/backward_grouped_mlp.py).
+    """
     if not HAVE_TE:
         return False
     try:
         from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU  # noqa: F401
     except ImportError:
         return False
-    return is_te_min_version("2.14.0")
+    if not is_te_min_version("2.14.0"):
+        return False
+    try:
+        from transformer_engine.pytorch.ops.fused import (
+            BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8,
+            ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8,
+        )
+    except ImportError:
+        return False
+    try:
+        return bool(
+            ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8.is_supported()
+            and BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8.is_supported()
+        )
+    except Exception:
+        # is_supported probes device capability and optional cudnn wrappers; be conservative.
+        return False
 
 
 _TE_GROUPED_MLP_OP_FUSER_SKIP_REASON = (
     "TEGroupedMLP op fuser (tests use use_transformer_engine_op_fuser=True) requires TE>=2.14 "
-    "with GroupedLinear/ScaledSwiGLU ops"
+    "with GroupedLinear/ScaledSwiGLU ops and MXFP8 CuTe fused grouped MLP forward+backward "
+    "(ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 / BackwardGroupedMLP_CuTeGEMMDSwiGLU_MXFP8 "
+    ".is_supported(): NVTE_CUTEDSL_FUSED_GROUPED_MLP, SM100, cudnn-frontend)"
 )
 
 
