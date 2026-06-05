@@ -764,6 +764,7 @@ class TEGroupedMLP(MegatronModule):
                 max_num_tokens=max_num_tokens,
                 num_tokens_tensor=tokens_per_expert.sum(),
                 avg_num_tokens=avg_num_tokens,
+                paged_stash_offload_factor=self.config.paged_stash_offload_factor,
             )
         else:
             stash_context = nullcontext()

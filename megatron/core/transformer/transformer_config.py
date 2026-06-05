@@ -1301,6 +1301,10 @@ class TransformerConfig(ModelParallelConfig):
     Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
     negative = actual-max; scale = abs(factor)."""
 
+    paged_stash_offload_factor: float = 0.0
+    """When moe_paged_stash is True and > 0: offload this fraction of avg_num_tokens to pinned
+    memory; rest goes to GPU stash. 0.0 = all to stash. Must be <= moe_expert_rank_capacity_factor."""
+
     fine_grained_offloading_max_inflight_offloads: Optional[int] = None
     """Per fine-grained offloading group name, max number of inflight offloads for that name not
     yet joined on the main stream (wait_event on D2H). The same cap applies to every name (e.g.,
@@ -1991,6 +1995,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
                     "there is no need to use paged stashing without it."
+                )
+            if self.paged_stash_offload_factor < 0:
+                raise ValueError("paged_stash_offload_factor must be >= 0.")
+            if self.paged_stash_offload_factor > 0 and (
+                self.paged_stash_offload_factor > self.moe_expert_rank_capacity_factor
+            ):
+                raise ValueError(
+                    "When moe_paged_stash and paged_stash_offload_factor > 0, "
+                    "paged_stash_offload_factor must be <= moe_expert_rank_capacity_factor."
                 )
             moe_offload_conflict = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
                 self.offload_modules

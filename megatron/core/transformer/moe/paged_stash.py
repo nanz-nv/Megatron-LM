@@ -150,6 +150,8 @@ class PagedTensor:
         max_num_tokens=None,
         hidden_size=None,
         page_size=64,
+        offload_tokens: int = 0,
+        pinned_offload_buffer=None,
     ):
         """
         Args:
@@ -160,6 +162,8 @@ class PagedTensor:
             max_num_tokens: Maximum number of tokens
             hidden_size: Hidden size
             page_size: Number of tokens per page
+            offload_tokens: Number of tokens offloaded to pinned buffer.
+            pinned_offload_buffer: Pinned CPU buffer used for offloaded tokens.
         """
         self._tensor = tensor
         self._original_tensor = None
@@ -176,6 +180,8 @@ class PagedTensor:
         self.max_num_tokens = max_num_tokens
         self.hidden_size = hidden_size
         self.page_size = page_size
+        self.offload_tokens = offload_tokens
+        self._pinned_offload_buffer = pinned_offload_buffer
 
         # Original tensor information
         self.original_shape = list(tensor.shape) if original_shape is None else original_shape
@@ -195,8 +201,10 @@ class PagedTensor:
         """Get the schedule layer."""
         return self.schedule_layer_no
 
-    def offload_to_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
-        """Offload the paged tensor to paged stash buffer (CUDA or host if CUDA full)."""
+    def offload_to_stash(
+        self, paged_stash_buffer: PagedStashBuffer, offload_stream=None, max_blocks=2048
+    ):
+        """Offload the paged tensor to paged stash buffer (and optionally to pinned)."""
         # Zero uninitialized metadata before copy kernel (enqueued on current stream;
         # stash_paged_tensors runs offload on the pack stream).
         self.page_record.zero_()
@@ -211,7 +219,19 @@ class PagedTensor:
             num_tokens_tensor = self.num_tokens_tensor
             max_num_tokens = self.max_num_tokens
 
-        tensor_to_copy = self._tensor
+        if self.offload_tokens > 0 and self._pinned_offload_buffer is not None and offload_stream:
+            view_2d = self._tensor.view(max_num_tokens, self.hidden_size)
+            gpu_slice = view_2d[: self.offload_tokens]
+            with torch.cuda.stream(offload_stream):
+                self._pinned_offload_buffer.copy_(gpu_slice, non_blocking=True)
+
+        if self.offload_tokens > 0:
+            stash_tokens_tensor = torch.clamp(num_tokens_tensor - self.offload_tokens, min=0)
+            view_2d = self._tensor.view(max_num_tokens, self.hidden_size)
+            tensor_to_copy = view_2d[self.offload_tokens :]
+        else:
+            stash_tokens_tensor = num_tokens_tensor
+            tensor_to_copy = self._tensor
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
         num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
@@ -228,7 +248,7 @@ class PagedTensor:
             tensor_to_copy.view(paged_stash_buffer.cuda_buffer.dtype),
             paged_stash_buffer.cuda_buffer,
             host_dst,
-            num_tokens_tensor,
+            stash_tokens_tensor,
             paged_stash_buffer.free_list_cuda,
             paged_stash_buffer.free_list_host,
             paged_stash_buffer.free_list_head,
@@ -248,11 +268,13 @@ class PagedTensor:
         self._original_tensor = self._tensor
         self._tensor = None
 
-    def reload_from_stash(self, paged_stash_buffer: PagedStashBuffer, max_blocks=2048):
-        """Reload the paged tensor from paged stash buffer (CUDA or host from spilled_to_host).
+    def reload_from_stash(
+        self, paged_stash_buffer: PagedStashBuffer, offload_stream=None, max_blocks=2048
+    ):
+        """Reload the paged tensor from paged stash buffer (and optionally from pinned).
 
         ``_tensor`` must already be allocated on the main (default) stream by the caller;
-        this method only enqueues unpack-stream kernels that fill it from the stash.
+        this method only enqueues unpack/offload-stream work that fills it from stash/pinned.
         """
         assert self._tensor is not None, "reload_from_stash expects _tensor pre-allocated on main"
         assert tuple(self._tensor.shape) == tuple(self.original_shape), (
@@ -267,6 +289,21 @@ class PagedTensor:
         else:
             num_tokens_tensor = self.num_tokens_tensor
             max_num_tokens = self.max_num_tokens
+
+        if self.offload_tokens > 0 and self._pinned_offload_buffer is not None and offload_stream:
+            view_2d = self._tensor.view(max_num_tokens, self.hidden_size)
+            gpu_slice = view_2d[: self.offload_tokens]
+            with torch.cuda.stream(offload_stream):
+                gpu_slice.copy_(self._pinned_offload_buffer, non_blocking=True)
+
+        if self.offload_tokens > 0:
+            stash_tokens_tensor = torch.clamp(num_tokens_tensor - self.offload_tokens, min=0)
+            view_2d = self._tensor.view(max_num_tokens, self.hidden_size)
+            # Match stash buffer element type (e.g. uint8 for FP8); same as non-offload path.
+            dst_tensor = view_2d[self.offload_tokens :].view(paged_stash_buffer.cuda_buffer.dtype)
+        else:
+            stash_tokens_tensor = num_tokens_tensor
+            dst_tensor = self._tensor.view(paged_stash_buffer.cuda_buffer.dtype)
         BLOCK_SIZE = GLOBAL_BLOCK_SIZE
         num_blocks = min(max_num_tokens, max_blocks)
         grid = (num_blocks,)
@@ -280,8 +317,8 @@ class PagedTensor:
         paged_stash_pop_kernel[grid](
             paged_stash_buffer.cuda_buffer,
             host_src,
-            self._tensor.view(paged_stash_buffer.cuda_buffer.dtype),
-            num_tokens_tensor,
+            dst_tensor,
+            stash_tokens_tensor,
             self.page_record,
             self.spilled_to_host,
             paged_stash_buffer.overflow,
@@ -376,6 +413,7 @@ class PipelinePostScheduleFunction(torch.autograd.Function):
         ctx.stash_manager.wait_for_stash_to_complete()
         if ctx.stash_manager._unpack_stream_status == 'reloading':
             current_stream.wait_stream(ctx.stash_manager.unpack_stream)
+            current_stream.wait_stream(ctx.stash_manager.offload_stream)
             ctx.stash_manager._unpack_stream_status = 'idle'
 
         return grad_output + (None,)
@@ -402,6 +440,7 @@ class PagedStashManager:
         # allocate streams and events for synchronization
         self.enabled = False
         self._pack_stream = torch.cuda.Stream()
+        self._offload_stream = torch.cuda.Stream()
         # Currently paged stashing is not stream-safe, so use the same stream for packing
         # and unpacking
         self._unpack_stream = self._pack_stream
@@ -434,10 +473,12 @@ class PagedStashManager:
         self.max_num_tokens = None
         # Optional hint: expected/average number of tokens (e.g., pre-padding estimate)
         self.avg_num_tokens = None
+        self.paged_stash_offload_factor = 0.0
         self.stash_buffers = None
         self.overflow = None
         self.host_spill = None
         self.device = None
+        self._pinned_offload_buffer_pool = {}
 
         # Page size for paged memory (default; overwritten from config in paged_stash_reset)
         self.page_size = 64
@@ -451,6 +492,11 @@ class PagedStashManager:
     def unpack_stream(self):
         """Get the unpack stream."""
         return self._unpack_stream
+
+    @property
+    def offload_stream(self):
+        """Get the offload stream."""
+        return self._offload_stream
 
     def set_current_layer_name(self, name):
         """Set the current layer name."""
@@ -471,7 +517,21 @@ class PagedStashManager:
     def remove_paged_tensor_from_stash(self):
         """Remove all paged tensors from the stash list."""
         if self.status == 'captured':
-            self.paged_tensors_to_stash.clear()
+            while len(self.paged_tensors_to_stash) > 0:
+                paged_tensor = self.paged_tensors_to_stash.pop(0)
+                if (
+                    paged_tensor.offload_tokens > 0
+                    and paged_tensor._pinned_offload_buffer is not None
+                ):
+                    key = (
+                        paged_tensor.offload_tokens,
+                        paged_tensor.hidden_size,
+                        paged_tensor.dtype,
+                    )
+                    self._pinned_offload_buffer_pool.setdefault(key, []).append(
+                        paged_tensor._pinned_offload_buffer
+                    )
+                    paged_tensor._pinned_offload_buffer = None
         else:
             pass
 
@@ -479,6 +539,7 @@ class PagedStashManager:
         """Stash the paged tensors."""
         current_stream = torch.cuda.current_stream()
         self.pack_stream.wait_stream(current_stream)
+        self.offload_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(self.pack_stream):
             if self.status == 'captured':
@@ -492,7 +553,9 @@ class PagedStashManager:
                 while len(self.paged_tensors_to_stash) > 0:
                     paged_tensor = self.paged_tensors_to_stash.pop(0)
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
-                    paged_tensor.offload_to_stash(stash_buffer)
+                    paged_tensor.offload_to_stash(
+                        stash_buffer, offload_stream=self.offload_stream
+                    )
                     self.paged_tensors_to_reload[pp_schedule_layer].append(paged_tensor)
                     self.paged_tensors_stash_in_progress.append(paged_tensor)
             else:
@@ -506,6 +569,7 @@ class PagedStashManager:
         current_stream = torch.cuda.current_stream()
         if self._pack_stream_status == 'stashing':
             current_stream.wait_stream(self.pack_stream)
+            current_stream.wait_stream(self.offload_stream)
             self._pack_stream_status = 'idle'
 
             # Deallocate original tensor after stash is complete
@@ -534,13 +598,29 @@ class PagedStashManager:
 
         if reload_batch:
             self.unpack_stream.wait_stream(current_stream)
+            self.offload_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(self.unpack_stream):
             if self.status == 'captured':
                 self._unpack_stream_status = 'reloading'
                 for paged_tensor in reload_batch:
                     stash_buffer = self.stash_buffers[paged_tensor.dtype][paged_tensor.hidden_size]
-                    paged_tensor.reload_from_stash(stash_buffer)
+                    paged_tensor.reload_from_stash(
+                        stash_buffer, offload_stream=self.offload_stream
+                    )
+                    if (
+                        paged_tensor.offload_tokens > 0
+                        and paged_tensor._pinned_offload_buffer is not None
+                    ):
+                        key = (
+                            paged_tensor.offload_tokens,
+                            paged_tensor.hidden_size,
+                            paged_tensor.dtype,
+                        )
+                        self._pinned_offload_buffer_pool.setdefault(key, []).append(
+                            paged_tensor._pinned_offload_buffer
+                        )
+                        paged_tensor._pinned_offload_buffer = None
             else:
                 pass
             assert len(self.paged_tensors_to_reload[pp_schedule_layer]) == 0, (
@@ -712,15 +792,28 @@ class PagedStashManager:
             self.max_avg_tokens_across_vp_stages = {}
             self.temp_avg_tokens_across_vp_stages = {}
 
-        avg_num_tokens = None
+        avg_num_tokens = int(self.avg_num_tokens) if self.avg_num_tokens is not None else None
+        effective_max = (
+            self.max_num_tokens // SCALE_INV_BLOCK_SIZE
+            if columnwise_scale_inv
+            else self.max_num_tokens
+        )
+        effective_avg = (
+            avg_num_tokens // SCALE_INV_BLOCK_SIZE
+            if (columnwise_scale_inv and avg_num_tokens is not None)
+            else avg_num_tokens
+        )
+        offload_tokens = (
+            min(effective_max, int(self.paged_stash_offload_factor * effective_avg))
+            if (self.paged_stash_offload_factor > 0 and effective_avg is not None)
+            else 0
+        )
         if self.status == 'capture':
 
             self.num_tokens = self.num_tokens_tensor.item()
             actual_num_tokens = (
                 self.num_tokens // SCALE_INV_BLOCK_SIZE if columnwise_scale_inv else self.num_tokens
             )
-
-            avg_num_tokens = int(self.avg_num_tokens) if self.avg_num_tokens is not None else None
 
             if (dtype, hidden_size) not in self.temp_tokens_across_vp_stages:
                 self.temp_tokens_across_vp_stages[dtype, hidden_size] = 0
@@ -735,6 +828,7 @@ class PagedStashManager:
             )
 
             # Track avg tokens across vp stages (if provided) using the same accumulation model.
+            # Stash buffer sizing uses full avg_num_tokens (unchanged by paged_stash_offload_factor).
             if avg_num_tokens is not None:
                 self.temp_avg_tokens_across_vp_stages[dtype, hidden_size] += (
                     avg_num_tokens
@@ -755,6 +849,26 @@ class PagedStashManager:
             tensor = tensor_truncated
 
         tensor.grouped_tensor_scale_inv = columnwise_scale_inv
+        pinned_offload_buffer = None
+        if offload_tokens > 0:
+            key = (offload_tokens, hidden_size, dtype)
+            pool = self._pinned_offload_buffer_pool.setdefault(key, [])
+            if self.status == 'capture':
+                if pool:
+                    pinned_offload_buffer = pool.pop()
+                else:
+                    pinned_offload_buffer = torch.empty(
+                        (offload_tokens, hidden_size),
+                        dtype=dtype,
+                        device='cpu',
+                        pin_memory=True,
+                    )
+            else:
+                assert pool, (
+                    f"Pinned buffer pool empty for key {key}; expected pre-allocation during capture."
+                )
+                pinned_offload_buffer = pool.pop()
+
         paged_tensor = PagedTensor(
             tensor,
             num_tokens_tensor=self.num_tokens_tensor,
@@ -771,6 +885,8 @@ class PagedStashManager:
             max_num_tokens=self.max_num_tokens,
             hidden_size=hidden_size,
             page_size=self.page_size,
+            offload_tokens=offload_tokens,
+            pinned_offload_buffer=pinned_offload_buffer,
         )
 
         if self.status == 'captured':
@@ -785,6 +901,19 @@ class PagedStashManager:
         if isinstance(saved_state, (PagedTensor)):
             columnwise_scale_inv = saved_state.is_columnwise_scale_inv
             if self.status == 'capture':
+                if (
+                    saved_state.offload_tokens > 0
+                    and saved_state._pinned_offload_buffer is not None
+                ):
+                    key = (
+                        saved_state.offload_tokens,
+                        saved_state.hidden_size,
+                        saved_state.dtype,
+                    )
+                    self._pinned_offload_buffer_pool.setdefault(key, []).append(
+                        saved_state._pinned_offload_buffer
+                    )
+                    saved_state._pinned_offload_buffer = None
                 num_tokens = saved_state.num_tokens_tensor.item()
                 key = (saved_state.dtype, saved_state.hidden_size)
                 if key in self.temp_tokens_across_vp_stages:
@@ -858,7 +987,11 @@ def paged_stash_group_start(tensor):
 
 
 def get_paged_stash_context(
-    name=None, max_num_tokens=None, num_tokens_tensor=None, avg_num_tokens=None
+    name=None,
+    max_num_tokens=None,
+    num_tokens_tensor=None,
+    avg_num_tokens=None,
+    paged_stash_offload_factor=None,
 ):
     """Get the paged stash context"""
     stash_manager = PagedStashManager.get_instance()
@@ -866,6 +999,9 @@ def get_paged_stash_context(
         return nullcontext()
     stash_manager.max_num_tokens = max_num_tokens
     stash_manager.avg_num_tokens = avg_num_tokens
+    stash_manager.paged_stash_offload_factor = (
+        paged_stash_offload_factor if paged_stash_offload_factor is not None else 0.0
+    )
     assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor)
     # One clone per context; PagedTensor reuses this tensor (no per-instance clone).
     stash_manager.num_tokens_tensor = num_tokens_tensor.clone()
